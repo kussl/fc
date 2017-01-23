@@ -33,6 +33,12 @@ impl Default for PaddingHalf {
 }
 
 #[macro_export]
+macro_rules! create_padding {
+    () => (let _: Padding = Default::default(););
+}
+
+
+#[macro_export]
 macro_rules! memory_page_addr {
     ($x:expr) => (((&$x as *const _) as i64) & !(4095));
 }
