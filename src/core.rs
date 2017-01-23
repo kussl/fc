@@ -107,6 +107,9 @@ pub fn private_single_stack_page_with_addr(addr: usize) {
 }
 
 
+
+
+
 /*
 Macros to facilitate calls to the functions for changing access to stack pages.
 */
@@ -114,7 +117,8 @@ Macros to facilitate calls to the functions for changing access to stack pages.
 #[macro_export]
 macro_rules! immutable_stack {
     ($x:expr) => (
-        let p_x98d7: Padding = Default::default();
+        let mut p_x98d7: Padding = Default::default();
+        p_x98d7.space[0] = 0; //Auxiliary value
         immutable_single_stack_page(&$x);
     );
 }
