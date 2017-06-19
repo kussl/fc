@@ -1,42 +1,70 @@
 use libc::mprotect;
 use libc::PROT_READ;
 use libc::PROT_WRITE;
+use libc::PROT_EXEC;
 use libc::PROT_NONE;
 use libc::c_void;
 use rand::random;
-use std::fmt;
+// use std::fmt;
 
-const P_DEFAULT: usize = 1200;
 
-#[allow(dead_code)]
-pub struct Padding {
-    pub space: [i64; P_DEFAULT]
-}
-
-impl Default for Padding {
-    fn default() -> Padding { Padding {space: [0; P_DEFAULT]} }
-}
-
-impl fmt::Debug for Padding {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "Padding")
+/*
+A general function to disable or enable mprotect, or to add
+additional page addresses after disabling mprotect. Each of the three
+operations have a unique code that will be chosen based on the caller's request parameter.
+request = 0 (disable) | 1 (enable) | 2 (addpages)
+*/
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn kernel_protocol(request: i8, page: usize) {
+    let mut code = 0x00A00A00C;
+    if request == 1 {
+        code = 0x00A00A00D;
     }
+    else if request == 2 {
+        code = 0x00A00A00B;
+    }
+    //println!("Code: 0x{:X}", code);
+    /*
+    rax: system call number
+    rbx: 0 (i.e., ignore)
+    rcx: 0 (i.e., ignore)
+    rdx: request from the kernel
+    */
+    unsafe {
+        asm!("movq $$0x7D, %rax
+              movq $$0, %rbx
+              movq $0, %rcx
+              movq $1, %rdx
+              int $$0x80
+              " //jmp *$0
+              : /* no outputs */
+              : "m"(page),"m"(code)
+              : "rax", "rbx", "rcx", "rdx");
+    }
+    let _ = 100;
 }
 
-#[allow(dead_code)]
-pub struct PaddingHalf {
-    pub space: [i64; P_DEFAULT/2]
-}
-
-impl Default for PaddingHalf {
-    fn default() -> PaddingHalf { PaddingHalf {space: [0; P_DEFAULT/2]} }
-}
+/*
+Two macros to facilitate use of kernel_protocol
+*/
 
 #[macro_export]
-macro_rules! create_padding {
-    () => (let _: Padding = Default::default(););
+macro_rules! kernel_disable {
+    ($x:expr) => (kernel_protocol(0,$x););
+}
+#[macro_export]
+macro_rules! kernel_enable {
+    () => (kernel_protocol(1,0););
 }
 
+/*
+Memory page address calculator based on page size
+*/
+
+#[macro_export]
+macro_rules! page_size {
+    () => (4096);
+}
 
 #[macro_export]
 macro_rules! memory_page_addr {
@@ -44,174 +72,103 @@ macro_rules! memory_page_addr {
 }
 
 #[macro_export]
-macro_rules! memory_page_addr_usize {
-    ($x:expr) => ( (((&$x as *const _) as i64) & !(4095)) as usize );
+macro_rules! page_addr {
+    ($x:expr) => ( $x & !(4095) );
 }
 
+/*
+Only used for debugging purposes.
+*/
 #[macro_export]
 macro_rules! print_memory_addr {
     ($x:expr, $y:expr) => (println!("{:} address: {:?} at page 0x{:X}", $y, &$x as *const _, ((&$x as *const _) as i64) & !(4095)));
 }
 
 /*
-We'll define a special type for storing the kernel key on stack.
-We need this type for performing operations like drop to make sure protections are released when going out of scope.
+Padding
 */
-pub struct FcKernelKey {
-    pub key: usize
-}
-/*
-This will generate a key by simply using the rand crate. A better key generation algorithm should be used, later on.
-*/
-impl Default for FcKernelKey {
-    fn default() -> FcKernelKey { FcKernelKey {key: random::<usize>()} }
-}
-/*
-We'll probably need to implement some drop, but nothing for now.
-*/
-impl Drop for FcKernelKey {
-    fn drop(&mut self) {
-    }
+const P_DEFAULT: usize = 512;
+
+pub struct Padding {
+    pub space: [i64; P_DEFAULT]
 }
 
-/*
-A macro that will do the key generation by calling the default function and then returning the actual key.
-*/
-#[macro_export]
-macro_rules! get_kernel_key {
-    () => (
-    	FcKernelKey::default().key
-    );
+impl Default for Padding {
+    fn default() -> Padding { Padding {space: [random::<i64>(); P_DEFAULT]} }
 }
+
+#[macro_export]
+macro_rules! stack_padding {
+    () => (let _: Padding = Padding::default(););
+}
+
+
+
+
+/*
+Secure compartments
+*/
 
 /*
 This function receives a pointer to one of the bindings
 on a stack page. It will compute the start address of the page and will attempt to set the page to read only. The challenge is to avoid possible crashes because of wrong page numbering or because the page may be used in the future. For now, it will assume the page can safely be protected. Avoid calling other functions or introducing new bindings as much as possible, except for mprotect and the padding requirement, of course.
 */
-pub fn immutable_single_stack_page<T>(x: &T) {
+
+fn modify_page_permissions(addr: i64, permission: i32) {
     unsafe {
-        mprotect( (((x as *const _) as i64) & !(4095)) as *mut c_void, 4096, PROT_READ );
+        mprotect( (addr & !(4095)) as *mut c_void, 4096, permission );
     }
 }
 
-/*
-Same as immutable_single_stack_page but sets the page permission to NONE. No one can use the page.
-*/
-pub fn private_single_stack_page<T>(x: &T) {
-    unsafe {
-        mprotect( (((x as *const _) as i64) & !(4095)) as *mut c_void, 4096, PROT_NONE );
-    }
+pub fn immutable_sc<T>(x: &T) {
+    modify_page_permissions(((x as *const _) as i64), PROT_READ);
+}
+
+pub fn immutable_sc_u(x: i64) {
+    //stack_padding!();
+    modify_page_permissions(x, PROT_READ);
 }
 
 /*
-Same as private_single_stack_page but without giving a pointer to the variable. Instead, pass the address to the "PAGE" directly.
+Same as immutable_sc but sets the page permission to NONE. No one can use the page.
 */
-pub fn private_single_stack_page_with_addr(addr: usize) {
-    unsafe {
-        mprotect( addr as *mut c_void, 4096, PROT_NONE );
-    }
+pub fn private_sc<T>(x: &T) {
+    modify_page_permissions(((x as *const _) as i64), PROT_NONE);
+}
+
+pub fn normal_sc<T>(x: &T) {
+    modify_page_permissions(((x as *const _) as i64), PROT_READ | PROT_WRITE);
 }
 
 
-
-
-
-/*
-Macros to facilitate calls to the functions for changing access to stack pages.
-*/
-
-#[macro_export]
-macro_rules! immutable_stack {
-    ($x:expr) => (
-        let mut p_x98d7: Padding = Default::default();
-        p_x98d7.space[0] = 0; //Auxiliary value
-        immutable_single_stack_page(&$x);
-    );
+pub fn private_sc_u(x: i64) {
+    //stack_padding!();
+    modify_page_permissions(x, PROT_NONE);
 }
 
-#[macro_export]
-macro_rules! private_stack {
-    ($x:expr) => (
-        let p_x98d7: Padding = Default::default();
-        private_single_stack_page(&$x);
-    );
-}
+pub fn normal_sc_u(x: i64) {
+    stack_padding!();
 
-/*
-This function will reverse the effect of the previous functions.
-*/
-
-pub fn mutable_single_stack_page<T>(x: &T) {
-    unsafe {
-        mprotect( (((x as *const _) as i64) & !(4095)) as *mut c_void, 4096, PROT_READ | PROT_WRITE);
-    }
-}
-
-/*
-The previous one may crash when restroing a PROT_NONE page.
-*/
-pub fn mutable_single_stack_page_with_addr(addr: usize) {
-    unsafe {
-        mprotect( addr as *mut c_void, 4096, PROT_READ | PROT_WRITE);
-    }
-}
-
-#[macro_export]
-macro_rules! mutable_stack {
-    ($x:expr) => (
-        mutable_single_stack_page(&$x);
-    );
-}
-
-#[macro_export]
-macro_rules! protect_stack {
-    ($x:expr,$y:expr) => (
-    	$y = get_kernel_key!();
-    	let page = memory_page_addr_usize!($x);
-    	immutable_stack!($x);
-        disable_mprotect_stack(&$y, &page);
-    );
-}
-
-#[macro_export]
-macro_rules! free_stack {
-    ($x:expr,$y:expr) => (
-    	enable_mprotect_stack(&$y);
-    	mutable_stack!($x);
-    );
+    modify_page_permissions(x, PROT_READ | PROT_WRITE);
 }
 
 
 /*
-This function will request a ban on mprotect using a key that is stored
-on stack. Note that if the stack is read only at this point, this function
-will fail. We'll have to find a way to check for stack protection at this point.
-start holds the key, len holds the first page under protection, and prot holds a signal value that indicates the request from the kernel module.
+Need a macro to record main function's page address. This is for securing all the pages starting from main.
 */
 
-pub fn disable_mprotect_stack(key: &usize, pageaddr: &usize) {
-    let prot = 0x00A00A00C; //Request ID --disable mprotet
-    let len: usize = *pageaddr;
-    unsafe {
-        mprotect((*key) as *mut c_void, len, prot );
-    }
-}
+//static mut FRAMES: [i64; 30] = [0; 30];
 
-pub fn enable_mprotect_stack(key: &usize) {
-    let prot = 0x00A00A00D; //Request ID --enable mprotet
-    let len: usize = 0;
-    unsafe {
-        mprotect((*key) as *mut c_void, len, prot );
-    }
-}
 
-/*
-Protect more pages by requesting the kernel module to do so. Additional page address will be passed using a failed mprotect call which has no side effects.
-*/
-pub fn additional_pages_mprotect(key: &usize,addr: &usize) {
-    let prot = 0x00A00A00B; //Request ID --enable mprotet
-    let len = *addr;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+pub fn record_main(main_page: &mut i64) {
+    let mut rbp = 0;
     unsafe {
-        mprotect((*key) as *mut c_void, len, prot );
-    }
+                asm!("movq %rbp, $0
+                  "
+                  : "=r"(rbp)
+                  : /* no inputs */
+                  : "rbp");
+              }
+    *main_page = rbp;
 }

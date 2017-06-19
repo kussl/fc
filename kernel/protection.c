@@ -3,16 +3,19 @@
 #include <linux/init.h>      // included for __init and __exit macros
 #include <linux/kprobes.h>
 #include <linux/sched.h>
+#include <linux/kasan.h>
+#include <asm/stacktrace.h>
 
 /*
-Static assumption for the number of processes that will simultaneously ask for disabling mprotect. Ideally this has to be dynamic. 
+Static assumption for the number of processes that will simultaneously ask for disabling mprotect. Ideally this has to be dynamic.
 */
-#define MAX_PROC_IN_F_CODE 400
+#define MAX_PROC_IN_F_CODE 4000
 #define MAX_PAGES_ 100
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Hussain Almohri");
 MODULE_DESCRIPTION("A module for assisting a Rust program to protect its memory by allowing a process to request enabling or disabling mprotect which will assist the process itself to implement the actual memory protection.");
+
 
 
 /*
@@ -23,6 +26,8 @@ typedef struct rust_protection {
   unsigned long key;
   unsigned long pages[MAX_PAGES_];
   int pageindex;
+  int ret_signal;
+  unsigned long rip;
 } r_prot;
 
 
@@ -75,9 +80,9 @@ Linear search to decide if a page address is in a list of protected pages for a 
 static int match_page_range(unsigned long start, int index) {
   int i;
   for(i=0; i<in_f_code[index].pages[i]; i++) {
-    printk("Checking %lx\n", in_f_code[index].pages[i]);
+    //printk("Checking %lx\n", in_f_code[index].pages[i]);
     if(in_f_code[index].pages[i] <= start &&
-      start <= (in_f_code[index].pages[i] + 0x1000)) {
+      start < (in_f_code[index].pages[i] + 0x1000)) {
         return 1;
       }
   }
@@ -95,82 +100,81 @@ static void empty_page_range_for_process(int index) {
 }
 
 
-/*This one is called from rust_sys_mprotect to handle the case where
-a disable only is requested. Subsequent calls with the same key and requested will be ignored.
+
+static unsigned long ripvalue(void) {
+  struct pt_regs *tregs = task_pt_regs(current);
+  return tregs->ip;
+}
+
+
+
+
+/*
+This one is called from rust_sys_mprotect to handle the case where
+a disable only is requested.
+The user process must have provided a safe region address and a page address.
+The safe region address will be treated as a key. Later when an enable is
+requested, the key will be checked against the IP value and the value of the
+protected pages (see enable_mprotect_only).
 */
-static void disable_mprotect_only(int pid,unsigned long start, size_t len) {
+static void disable_mprotect_only(int pid, unsigned long safe_region, unsigned long page_address) {
+
+  //Check if the process is currently in protection. An index of the list of protected processes will be returned or -1 otherwise.
   int i = is_in_f_mode(pid);
 
-  /*Disable mprotect in future since pid has no previous record. We will regard len as a page to protect. Other pages can be added by subsequent calls.
+  /*
+  Disable mprotect in future since pid has no previous record.
   */
   if(i == -1) {
     in_f_code[pc].pid = pid;
-    in_f_code[pc].key = start;
-    in_f_code[pc].pages[in_f_code[pc].pageindex++] = len;
+    in_f_code[pc].key = safe_region;
+    in_f_code[pc].pages[in_f_code[pc].pageindex++] = page_address;
+    in_f_code[pc].rip = ripvalue();
+    printk("Key recorded: %lx\n", in_f_code[pc].key);
     pc = (pc +1) % MAX_PROC_IN_F_CODE;
   }
+  /*
+  A disable call for an already protected process is useless.
+  */
   else {
-    //A second call will be ignored if with the same key.
-    if (start == in_f_code[i].key) {
-
-    }
-    //A second call will result in action if the key doesn't match.
-    else {
-      rust_take_action(start);
-    }
+    //ignore
   }
 }
 
-/*This one is called from rust_sys_mprotect to handle the case where
-a enable only is requested. Subsequent calls with the same key and requested will be ignored.
+
+/*This one is called from rust_sys_mprotect to enable mprotect for the current process. No parameters are required.
 */
-static void enable_mprotect_only(int pid,unsigned long start, size_t len) {
+static void enable_mprotect_only(int pid, unsigned long RIP) {
+
+  //Find the process' index in the list of protected processes. If -1, the process is not protected; ignore.
   int i = is_in_f_mode(pid);
 
   if(i == -1) {
-    //Ignore the enable call if no disable preceeded. Also, it won't harm anyone.
+    //Ignore the enable call if no disable preceeded. It won't harm anyone.
   }
   else {
     /*
-    pid has called mprotect for disabling before. It's OK to take out pid from the list and remove its protected pages. But if the key (which is the start parameter) does not match the one in records, then take action.
+    pid has called mprotect for disabling before. Check if IP is pointing to the safe region address. If so, the call is coming from FC. Otherwise, assume it's malicious. In both cases, empty the process.
     */
-    if (start == in_f_code[i].key) {
+
+    if (RIP == in_f_code[i].key) {
+      printk("FC: Key %lx matched. Enabling mprotect..\n", RIP);
       in_f_code[i].pid = -1;
       in_f_code[i].key = -1;
       empty_page_range_for_process(i);
     }
     //Keys don't match, so take action.
     else {
-      rust_take_action(start);
+      in_f_code[i].pid = -1;
+      in_f_code[i].key = -1;
+      empty_page_range_for_process(i);
+      printk("FC: Keys don't match: have %lx vs given %lx\n", in_f_code[i].key, RIP);
+      rust_take_action(RIP);
     }
   }
 }
 
-/*This one is called from rust_sys_mprotect to handle the case where
-a disable is requested. Subsequent calls with the same key and requested will result in enabling mprotect and removing the process from the list.
-*/
-static void disable_and_enable_mprotect(int pid,unsigned long start, size_t len) {
-  int i = is_in_f_mode(pid);
-  //Disable mprotect in future.
-  if(i == -1) {
-    in_f_code[pc].pid = pid;
-    in_f_code[pc].key = start;
-    in_f_code[pc].pages[in_f_code[pc].pageindex++] = len;
-    pc = (pc +1) % MAX_PROC_IN_F_CODE ;
-  }
-  //Re-enable mprotect in future, if the key matches.
-  else {
-    if (start == in_f_code[i].key) {
-        in_f_code[i].pid = -1;
-        in_f_code[i].key = -1;
-        empty_page_range_for_process(i);
-    }
-    else {
-      //The key does not match.
-      rust_take_action(start);
-    }
-  }
-}
+
 
 /*This one is called from rust_sys_mprotect to handle tadditional pages to be added for protection. Subsequent calls with the same key will add the provided page address to the list of proectected pages for the current process.
 */
@@ -193,29 +197,28 @@ The kernel invokes rust_sys_mprotect whenever a process calls sys_mprotect. rust
 static long rust_sys_mprotect(unsigned long start, size_t len, unsigned long prot) {
 
   int pid = task_pid_nr(current);
+  struct pt_regs *tregs = task_pt_regs(current);
 
-  //Both enable and disable mprotect
-  if(prot == 0xa00a00a) {
-    printk( "%d %s: FC (DIS/ENABLE): %lu len %lx prot %lx \n",
-                pid, current->comm,start,len,prot);
-    disable_and_enable_mprotect(pid, start, len);
+  unsigned long IP = 0;
+  unsigned long PAGE = 0;
+
+  if(prot == 0xa00a00c || prot == 0xa00a00d || prot == 0xa00a00b) {
+      printk( "%d %s: FC: %lu len %lx prot %lx ip %lx\n",
+              pid, current->comm,tregs->bx,tregs->cx,prot,tregs->ip);
+      IP = tregs->ip;
+      PAGE = tregs->cx;
   }
+
   //Only disable mprotect
-  else if(prot == 0xa00a00c) {
-    printk( "%d %s: FC (DISABLE): %lu len %lx prot %lx \n",
-                pid, current->comm,start,len,prot);
-    disable_mprotect_only(pid,start,len);
+  if(prot == 0xa00a00c) {
+    disable_mprotect_only(pid,IP,PAGE);
   }
   //Only enable mprotect
   else if(prot == 0xa00a00d) {
-    printk( "%d %s: FC (ENABLE): %lu len %lx prot %lx \n",
-                pid, current->comm,start,len,prot);
-    enable_mprotect_only(pid,start,len);
+    enable_mprotect_only(pid,IP);
   }
   //Receive additional page addresses to protect.
   else if(prot == 0xa00a00b) {
-    printk( "%d %s: FC (PAGES): %lu len %lx prot %lx\n",
-                pid, current->comm,start,len,prot);
     add_pages_to_protection(pid, start, len);
   }
   //No signal from the process
@@ -224,15 +227,62 @@ static long rust_sys_mprotect(unsigned long start, size_t len, unsigned long pro
     if(i> -1) {
       //In protected mode, and a call to mprotect without a protocol call, regard as an alarm
       if (match_page_range(start, i)){
-        printk("Start address in forbidden range.\n");
+        printk("Start address in forbidden range\n");
         rust_take_action(start);
       }
     }
   }
-	/* Always end with a call to jprobe_return(). */
+
+
 	jprobe_return();
 	return 0;
 }
+
+/*
+int kretprobe_handler(struct kretprobe_instance *ri, struct pt_regs *regs) {
+  int pid = task_pid_nr(current);
+  int i = is_in_f_mode(pid);
+  int ret_signal = check_ret_signal(i);
+  void *stack = task_stack_page(current);
+  unsigned long *last = end_of_stack(current);
+  //unsigned long retval = regs_return_value(regs);
+  struct pt_regs *tregs = task_pt_regs(current);
+  long eip = regs->ip;
+  long esp = regs->sp;
+
+  unsigned long *ip,*sp;
+  ip = (unsigned long *) eip;
+  sp = (unsigned long *) esp;
+
+
+  //A disable signal
+  if(ret_signal==1) {
+  }
+  //An enable signal
+  else if (ret_signal==2) {
+    printk("Stored rip: 0x%lx\n", in_f_code[i].rip);
+
+    in_f_code[i].pid = -1;
+    in_f_code[i].key = -1;
+    empty_page_range_for_process(i);
+    //printk("FC (RET-2): 0x%lu\n", regs_return_value(regs));
+    printk("Original return address: 0x%lx\n", (unsigned long)ri->ret_addr);
+    printk("Top of stack: 0x%lx\n", *(unsigned long*)(stack));
+    printk("End of stack: 0x%lx\n", *last);
+    //printk("current->stack: 0x%lx\n", st);
+    printk("EIP: 0x%lx %lx\n", *((unsigned long *)eip), eip);
+    printk("ESP: 0x%lx %lx\n", *sp, esp);
+
+    pr_info(" ip = %lx, t-ip = %lx, sp = %lx, t-sp = %lx, flags = 0x%lx\n",
+		 regs->ip, tregs->ip, regs->sp, tregs->sp, regs->flags);
+
+  }
+  // if( strcmp("web",current->comm) == 0) {
+  //   printk("Original return address (read): 0x%lx\n", (unsigned long)ri->ret_addr);
+  // }
+  return 0;
+}*/
+
 
 
 /*
@@ -259,12 +309,32 @@ static int jprobe_init(void)
 	return 0;
 }
 
+/*
+static struct kretprobe rp = {
+  .kp = {
+    .symbol_name = "sys_mprotect",
+  },
+  .handler = kretprobe_handler,
+  .maxactive = NR_CPUS,
+};
+
+
+static int kretprobe_init(void) {
+  int ret = register_kretprobe(&rp);
+  if (ret < 0) {
+		printk(KERN_INFO "register_kretprobe failed, returned %d\n", ret);
+		return -1;
+	}
+  return 0;
+} */
+
 
 
 static int __init protection_init(void)
 {
     printk(KERN_INFO "Fidelius Charm Kernel Assist ==> \n");
     jprobe_init();
+    //kretprobe_init();
     return 0;    // Non-zero return means that the module couldn't be loaded.
 }
 
@@ -272,6 +342,7 @@ static void __exit protection_cleanup(void)
 {
     printk(KERN_INFO "Fidelius Charm Kernel Assist <==\n");
     unregister_jprobe(&my_jprobe);
+    //unregister_kretprobe(&rp);
 }
 
 module_init(protection_init);

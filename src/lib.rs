@@ -1,4 +1,4 @@
-
+#![feature(asm)]
 
 extern crate libc;
 extern crate rand;
