@@ -10,25 +10,23 @@ use fc::core::*;
 
 fn uses_ffi_at_some_point() { 
   /* Create a padding to isolate the return address. */
-  create_padding!();
+  stack_padding!();
   let secret1 = "secret"; 
   let mut secret2 = vec![1, 2, 3];
   
   /*
-  1. Generate a key
-  2. Introduce padding to isolate the memory page for the bindings above.
-  3. Protect the isolated memory page.
-  4. Disable access to mprotect.
+  1. Introduce padding to isolate the memory page for the bindings above.
+  2. Protect the isolated memory page.
+  3. Disable access to mprotect.
   */
-  let kernel_key = get_kernel_key!();
-  create_padding!(); 
+  stack_padding!(); 
   
   //Key used as argument to find the start address of the page.
-  immutable_single_stack_page(&secret1);
+  immutable_sc(&secret1);
   //This one is for the heap memory allocated for secret2.
-  immutable_single_stack_page((&secret2[0]));
+  immutable_sc((&secret2[0]));
   //Communicate the secret key to the kernel. 
-  disable_mprotect_stack(&kernel_key, &memory_page_addr_usize!(key));
+  kernel_disable!(&memory_page_addr_usize!(secret1));
   
   let p = 10; 
   
@@ -41,9 +39,9 @@ fn uses_ffi_at_some_point() {
   1. Enabling access to mprotect again.
   2. Changing all page permissions back to normal.
   */
-  enable_mprotect_stack(&kernel_key);
-  mutable_single_stack_page(&secret1);
-  mutable_single_stack_page((&secret2[0])); 
+  kernel_enable!();
+  normal_sc(&secret1);
+  normal_sc((&secret2[0])); 
 }
 ```
             
