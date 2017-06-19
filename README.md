@@ -41,7 +41,7 @@ fn uses_ffi_at_some_point() {
   */
   kernel_enable!();
   normal_sc(&secret1);
-  normal_sc((&secret2[0])); 
+  normal_sc(&secret2[0]); 
 }
 ```
             
